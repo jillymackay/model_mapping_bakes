@@ -1,0 +1,352 @@
+---
+title: "models"
+author: "Jilly MacKay"
+date: "17 April 2019"
+output:
+  html_document:
+    keep_md: true
+    theme: spacelab
+    highlight: haddock
+    toc: true 
+    toc_float: true
+    toc_depth: 3
+---
+
+
+These are some notes about running multiple models using `purrr` and trying to get better at logistic regressions and data visualisations and a whole bunch of stuff its embarassing I don't already know
+
+## Learning Outcomes
+
+# The R Environment
+```{r}
+library(tidyverse)
+library(skimr)
+library(yardstick)
+library(rsample)
+library(modelr)
+library(fs)
+# devtools::install_github("apreshill/bakeoff")
+library (bakeoff)
+
+
+
+set.seed(13)
+
+
+```
+
+
+
+Let's explore the data
+
+
+```{r}
+
+skim(baker_results)
+
+```
+
+
+
+Here's a few visualisations I made - sequentially. I've only really deleted code that doesn't work. Consider this my version of a tidytuesday
+
+
+```{r}
+
+baker_results %>% 
+  ggplot(aes(x = technical_winner, y = series_winner, colour = baker_first)) +
+  geom_point()
+
+# okay that's pretty uninformative
+
+baker_results %>% 
+  ggplot(aes(y = technical_winner, x = as.factor(series_winner))) +
+  geom_boxplot()
+
+
+baker_results %>% 
+  ggplot(aes(y = technical_top3, x = as.factor(series_winner))) +
+  geom_boxplot()
+
+
+baker_results %>% 
+  ggplot(aes(y = technical_bottom, x = as.factor(series_winner))) +
+  geom_boxplot()
+
+
+baker_results %>% 
+  ggplot(aes(y = percent_technical_top3, x = as.factor(series_winner))) +
+  geom_boxplot()
+
+
+```
+
+I'm going to check to see if any of the other datasets are better. 
+
+```{r}
+
+skim(bakes)
+skim(bakers)
+
+```
+
+
+Ok so I'm definitely using the dataset I want to use. 
+
+
+I think I want to try and build a model to predict whether or not someone will win bake off
+
+I might be interested in:
+* total episodes appeared (because if you have more episode you're more likely to win)
+* age
+* percent technical top 3
+* percent technical bottom (need to calculate)
+* series (maybe things changed with time)
+* percent star baker (need to calculate)
+
+
+First I need to modify the data
+
+
+```{r}
+
+bak <- baker_results %>% 
+  mutate (series_winner = case_when (series_winner == 0 ~ "No",
+                                     series_winner == 1 ~ "Yes"),
+          series_winner = as_factor(series_winner),
+          percent_technical_bottom = technical_bottom/total_episodes_appeared*100,
+          percent_star_baker = star_baker/total_episodes_appeared*100)
+```
+
+
+I can run a model on a variety of things:
+
+
+```{r}
+
+model_logistic_example <- glm(series_winner ~ age + percent_star_baker + percent_technical_bottom, data=bak, family=binomial(link="logit"))
+
+summary(model_logistic_example)
+
+```
+
+And initally this is kind of interesting that the most significant predictor here is the percent_technical_bottom, but this is a really bad way of exploring data 
+
+We can check for collinearity using [the variance inflation factor](https://www.statisticshowto.datasciencecentral.com/variance-inflation-factor/).
+
+```{r}
+car::vif(model_logistic_example)
+```
+
+Here we see that age is .004% bigger than we would expect if there was no multicollinearity, and percent star baker and percent technical bottom are each about .09% bigger than we would expect. 
+
+
+
+
+But we might want to explore lots of models at one time. 
+
+First I'm going to create a list of models that I might possibly be interested in.
+```{r}
+models <- list (
+  series_winner ~ age,
+  series_winner ~ percent_star_baker,
+  series_winner ~ percent_technical_bottom,
+  series_winner ~ percent_technical_top3,
+  series_winner ~ percent_star_baker * series,
+  series_winner ~ percent_star_baker + age,
+  series_winner ~ percent_technical_bottom + percent_technical_top3 + percent_star_baker
+  )
+
+```
+
+Next I'm going to map each model to the data.
+
+
+```{r}
+
+modelling <- models %>% 
+  set_names() %>% 
+  map(glm, data=bak, family=binomial(link="logit")) 
+
+
+
+modelling %>% 
+  map_df(broom::glance, .id = "models") %>% 
+  ggplot() +
+  aes(x = models, y = logLik) +
+  geom_point() +
+  coord_flip()
+
+
+
+ models %>% 
+  set_names() %>% 
+  map(glm, data=bak, family=binomial(link="logit")) %>% 
+  map(summary) 
+
+```
+
+Examining all these - it seems to me that it's slightly more important to not be in the technical bottom 3 than to be in the technical top 3, and these models are the most important. 
+
+Let's explore these two models in more depth with k-fold cross-validation
+
+We'll resample the data and then plot our two models of interest against it. 
+
+```{r}
+
+bak_cv <- bak %>%
+  rsample::vfold_cv(v = 5)
+
+model_bottom3 <- bak_cv %>%
+  mutate(model = map(splits, ~ glm(series_winner ~ percent_technical_bottom,
+    data = analysis(.x), 
+    family=binomial(link="logit")
+  ))) %>%
+  mutate(fit = map(model, tidy))
+
+model_bottom3 <- model_bottom3 %>%
+  mutate(predict = map2(
+    splits,
+    model, ~ tibble(
+      predict = predict(.y, assessment(.x)),
+      actual = assessment(.x)$series_winner
+    )
+  ))
+
+
+
+
+model_top3 <- bak_cv %>%
+  mutate(model = map(splits, ~ glm(series_winner ~ percent_technical_top3,
+    data = analysis(.x), 
+    family=binomial(link="logit")
+  ))) %>%
+  mutate(fit = map(model, tidy))
+
+model_top3 <- model_top3 %>%
+  mutate(predict = map2(
+    splits,
+    model, ~ tibble(
+      predict = predict(.y, assessment(.x)),
+      actual = assessment(.x)$series_winner
+    )
+  ))
+
+
+model_bottom3 %>%
+  unnest(fit) %>%
+  ggplot() +
+  aes(x = id, y = estimate) +
+  geom_point() +
+  facet_wrap(~term, scale = "free") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90))
+
+
+model_top3 %>%
+  unnest(fit) %>%
+  ggplot() +
+  aes(x = id, y = estimate) +
+  geom_point() +
+  facet_wrap(~term, scale = "free") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90))
+
+
+model_top3 %>%
+  unnest(fit) %>%
+  group_by(term) %>%
+  summarise (estimate = mean(estimate), 
+             error = mean (std.error),
+             statistic = mean (statistic),
+             p = mean (p.value))
+
+
+model_bottom3 %>%
+  unnest(fit) %>%
+  group_by(term) %>%
+  summarise (estimate = mean(estimate), 
+             error = mean (std.error),
+             statistic = mean (statistic),
+             p = mean (p.value))
+
+```
+
+
+So on the cross-validated data, on average the estimate of the coefficient for the percent_bottom_3 was slightly more informative. 
+
+
+
+
+
+Had a new idea for how to explore the data
+
+
+```{r}
+bak %>% 
+  rename ("Baker's Age" = "age", "% Eligible Star Bakers Won" = "percent_star_baker",
+          "% Eligible in Technical Top 3" = "percent_technical_top3",
+          "% Eligible in Technical Bottom 3" = "percent_technical_bottom") %>% 
+  gather (key = predictor, value = value,  "Baker's Age", "% Eligible Star Bakers Won", "% Eligible in Technical Top 3", "% Eligible in Technical Bottom 3") %>% 
+  ggplot (aes (y = value, x = series_winner, fill = predictor)) +
+  geom_boxplot() +
+  facet_wrap(~predictor, scales = "free") +
+  theme_classic()+
+  theme(legend.position = "none") +
+  labs (x = "Winner", y = "Predictor",
+        title = "Possible predictors of Great British Bake Off Winners",
+        subtitle = "Data from apreshill\\bakeoff") +
+  scale_fill_brewer(palette="Accent") +
+  coord_flip()
+
+```
+
+
+My final verdict:
+
+```{r}
+model_tech_bottom <- glm(series_winner ~ percent_technical_bottom, data=bak, family=binomial(link="logit"))
+
+summary(model_tech_bottom)
+
+```
+
+
+
+Can I test this any better
+
+
+```{r}
+
+optCutOff <- optimalCutoff(testData$ABOVE50K, predicted)
+
+model_bottom3 <- model_bottom3 %>%
+  mutate(predict = map2(
+    splits,
+    model, ~ tibble(
+      predict = predict(.y, assessment(.x)),
+      actual = assessment(.x)$series_winner
+    )
+  ))
+
+# This doesn't work and I'm not sure why
+model_bottom3 %>% 
+  mutate(optCutOff = map2(
+    .x = splits,
+    .f = model, ~tibble(
+      optCutOff = optimalCutoff((.x)$series_winner, predict)
+  )))
+
+
+
+
+# lets try...
+
+model_bottom3 %>% 
+  unnest(predict) %>% 
+  mutate(opt = optimalCutoff(actual, predict)) 
+
+
+# not sure what this is telling me
+
+```
